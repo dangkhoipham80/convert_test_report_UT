@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Test report — Excel → text</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="bg-blob" aria-hidden="true"></div>
+  <div id="serverBanner" class="server-banner" role="status" hidden></div>
+  <div class="wrap">
+    <header class="hero">
+      <p class="badge">Local · không gửi dữ liệu ra internet</p>
+      <h1>Chuyển bảng test từ Excel</h1>
+      <p class="lead">Copy vùng trong Excel (Ctrl+C), dán vào ô bên dưới hoặc bấm <strong>Lấy từ clipboard</strong>. Chọn định dạng đầu ra rồi bấm chuyển đổi.</p>
+    </header>
+
+    <section class="card input-card">
+      <div class="tool-row">
+        <span class="label">Dữ liệu từ Excel (TSV)</span>
+        <div class="btn-group">
+          <button type="button" class="btn btn-ghost" id="btnClip" title="Cần localhost + thao tác bấm nút">Lấy từ clipboard</button>
+          <button type="button" class="btn btn-ghost" id="btnClear">Xóa ô</button>
+        </div>
+      </div>
+      <textarea id="input" class="mono" spellcheck="false" placeholder="Dán Ctrl+V vào đây (hoặc nút Lấy từ clipboard)…"></textarea>
+      <p class="hint">Không dán trực tiếp vào cửa sổ PowerShell đen — dán ở đây hoặc trong ô này.</p>
+    </section>
+
+    <section class="actions">
+      <button type="button" class="btn btn-primary" id="btnTsv" data-format="flat-tsv">
+        Chuyển → TSV (mỗi ô 1 dòng)
+      </button>
+      <button type="button" class="btn btn-secondary" id="btnMd" data-format="markdown">
+        Chuyển → Markdown
+      </button>
+    </section>
+
+    <section class="actions ai-row">
+      <button type="button" class="btn btn-accent" id="btnAiPrompt" title="Chạy ngay trên trình duyệt — không gọi server; mỗi mục Login, Register, … một block ### + prompt">
+        Sinh prompt cho AI (matrix TSV)
+      </button>
+    </section>
+
+    <section class="card input-card matrix-xlsx-card">
+      <div class="tool-row">
+        <span class="label">Matrix TSV từ GPT (dán khối tab)</span>
+        <button type="button" class="btn btn-ghost" id="btnMatrixClear">Xóa ô</button>
+      </div>
+      <textarea id="matrixInput" class="mono" spellcheck="false" placeholder="Dán toàn bộ bảng quyết định (có cột A–D + AUTH-…, tab phân tách)… Cần bật server (python serve_ui.py) để tải .xlsx."></textarea>
+      <p class="hint">Dùng khi ChatGPT trả bản text: bấm <strong>Tải Excel .xlsx</strong> — file mở trong Excel, có Tahoma, nền xanh mục + hàng mã, merge A/B, dropdown O ở vùng tick (cần <code>pip install openpyxl</code>). Mở trang qua <code>http://localhost:…</code> cùng cổng với <code>serve_ui.py</code> thì gọi API cùng origin (tránh lỗi fetch).</p>
+      <div class="actions matrix-xlsx-actions">
+        <button type="button" class="btn btn-primary" id="btnMatrixXlsx">Tải Excel (.xlsx) đúng format</button>
+      </div>
+    </section>
+
+    <section class="card output-card">
+      <div class="tool-row">
+        <span class="label">Kết quả</span>
+        <button type="button" class="btn btn-ghost" id="btnCopy" disabled>Sao chép kết quả</button>
+      </div>
+      <textarea id="output" class="mono" readonly placeholder="Kết quả sẽ hiện ở đây…"></textarea>
+    </section>
+
+    <section class="card output-card ai-prompt-card" id="aiPromptCard" hidden>
+      <div class="tool-row">
+        <span class="label">Prompt theo từng mục (mỗi khối tách bằng <code>---</code> — copy từng cái vào ChatGPT)</span>
+        <button type="button" class="btn btn-ghost" id="btnCopyPrompt" disabled>Sao chép tất cả (nối bằng <code>---</code>)</button>
+      </div>
+      <p class="hint" id="aiPromptHint" hidden>Danh sách mã theo từng mục — ưu tiên dán từng prompt một, không cần dán gộp.</p>
+      <ol class="ai-prompt-toc mono" id="aiPromptToc" hidden></ol>
+      <div id="aiPromptBlocks" class="ai-prompt-blocks"></div>
+    </section>
+
+    <section class="card error-log-card" id="errorLogCard" hidden>
+      <div class="tool-row">
+        <span class="label">Log lỗi (kỹ thuật)</span>
+        <div class="btn-group">
+          <button type="button" class="btn btn-ghost" id="btnCopyErrorLog" disabled>Sao chép log</button>
+          <button type="button" class="btn btn-ghost" id="btnClearErrorLog">Ẩn</button>
+        </div>
+      </div>
+      <pre id="errorLog" class="error-log" spellcheck="false"></pre>
+    </section>
+
+    <p class="status" id="status" role="status"></p>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="ai_matrix_prompt.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
