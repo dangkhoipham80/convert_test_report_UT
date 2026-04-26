@@ -1,10 +1,15 @@
 """
 Dán TSV bảng quyết định (matrix 4+ cột mã) → .xlsx định dạng dự án:
 Tahoma 8, nền xanh đậm cột mục + hàng mã, merge A/B/C theo cấu trúc, dropdown O ở vùng tick.
+
+Ô TSV bắt đầu bằng = được ghi đúng công thức Excel (ví dụ =COUNTIF(E10:HG10,"P"), =SUM(N8,-A8,-C8)).
+Công thức hàng 6 (Passed/Failed/…) có thể ghi đè bằng biến môi trường: MATRIX_F6_PASSED, MATRIX_F6_FAILED,
+MATRIX_F6_UNTESTED, MATRIX_F6_N, MATRIX_F6_A, MATRIX_F6_B, MATRIX_F6_TOTAL.
 """
 from __future__ import annotations
 
 import io
+import os
 import re
 from typing import List, Optional, Tuple
 
@@ -24,6 +29,59 @@ _EXACT_B = re.compile(
 )
 
 _DATE_PAT = re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b")
+
+# Dòng cấp 1: metadata + 2 dòng tổng hợp công thức + 1 dòng trống; ma trận bắt đầu từ 1+REPORT_HEADER_ROWS
+REPORT_HEADER_ROWS = 7
+# Có thể ghi đè bằng biến môi trường: MATRIX_DEFAULT_FUNCTION_CODE, etc.
+_DEFAULT_FUNCTION_CODE = os.environ.get("MATRIX_DEFAULT_FUNCTION_CODE", "UTC001")
+_DEFAULT_FUNCTION_NAME = os.environ.get("MATRIX_DEFAULT_FUNCTION_NAME", "Login")
+_DEFAULT_PERSON = os.environ.get("MATRIX_DEFAULT_PERSON", "Phạm Đăng Khôi")
+_DEFAULT_LINES_OF_CODE = os.environ.get("MATRIX_DEFAULT_LINES_OF_CODE", "160")
+
+
+def _is_excel_formula_str(s: str) -> bool:
+    t = (s or "").strip()
+    return bool(t) and t.startswith("=")
+
+
+def _set_openpyxl_cell_value(cell, v: str | int | float | None) -> None:
+    """Gán giá trị ô: chuỗi bắt đầu = là công thức Excel (đúng dạng người dùng nhập)."""
+    from openpyxl.cell.cell import MergedCell
+
+    if isinstance(cell, MergedCell):
+        return
+    if v is None:
+        cell.value = None
+        return
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        cell.value = v
+        return
+    s = str(v)
+    st = s.strip()
+    if not st:
+        cell.value = None
+        return
+    if st.startswith("="):
+        cell.value = st
+    else:
+        cell.value = s
+
+
+def _row6_formula_env_overrides() -> dict[int, str | None]:
+    """Công thức tùy chọn hàng 6 (Passed / Failed / …) — cùng cú pháp Excel, ví dụ =COUNTIF(E43:HG43,'P')."""
+    def g(k: str) -> str | None:
+        t = (os.environ.get(k) or "").strip()
+        return t if t else None
+
+    return {
+        1: g("MATRIX_F6_PASSED"),
+        3: g("MATRIX_F6_FAILED"),
+        5: g("MATRIX_F6_UNTESTED"),
+        11: g("MATRIX_F6_N"),
+        12: g("MATRIX_F6_A"),
+        13: g("MATRIX_F6_B"),
+        14: g("MATRIX_F6_TOTAL"),
+    }
 
 
 def _last_date_in_cell(s: str) -> str:
@@ -115,6 +173,216 @@ def _find_r_type_row(grid: List[List[str]], nrows: int) -> int:
     )
 
 
+def _find_r_passed_failed_row(grid: List[List[str]], nrows: int) -> int:
+    for i in range(nrows):
+        if _is_passed_failed_row_b(_row_i_col1_strips(grid, i)):
+            return i
+    return -1
+
+
+def _find_nab_data_row(
+    grid: List[List[str]], nrows: int, c0: int, c1: int, r_type: int, r_res: int
+) -> int:
+    """Dòng lưới có ít nhất một ô cột mã = N, A, hoặc B (dòng mẫu N/A/B)."""
+    if c0 < 0 or c1 < c0:
+        return -1
+
+    def score_nab(ri: int) -> int:
+        if ri < 0 or ri >= len(grid):
+            return 0
+        r = grid[ri]
+        s = 0
+        for ci in range(c0, c1 + 1):
+            if ci < len(r) and (r[ci] or "").strip() in ("N", "A", "B"):
+                s += 1
+        return s
+
+    for ri in (r_type, r_type + 1) if r_type >= 0 else ():
+        if 0 <= ri < nrows and score_nab(ri) > 0:
+            return ri
+    start = r_res + 1 if r_res >= 0 else 0
+    for ri in range(start, nrows):
+        if score_nab(ri) > 0:
+            return ri
+    return -1
+
+
+def _row_excel(ri: int, offset: int) -> int:
+    """Grid 0-based row → Excel 1-based row, sau vùng header báo cáo."""
+    return ri + 1 + offset
+
+
+def _write_unit_test_metadata_header(
+    ws,
+    offset: int,
+    c0: int,
+    c1: int,
+    h_row: int,
+    nab_row: int,
+    r_pf: int,
+    ncols_grid: int,
+) -> None:
+    """
+    Nhãn (A–B, E–J 1–3, tổng hợp 5) căn trái, in đậm, viết thường; hàng 5 gộp K–M → "N/A/B" (giữa).
+    Giá trị C–D / N (italic) giữ căn giữa như bảng mẫu.
+    """
+    from openpyxl.styles import Alignment, Border, Font, Side
+    from openpyxl.utils import get_column_letter
+
+    last_c = 16
+    _ = ncols_grid
+
+    thin = Side(style="thin", color="000000")
+    b_all = Border(left=thin, right=thin, top=thin, bottom=thin)
+    font_8 = Font(name=FONT_MAIN, size=8, color=FC_BLACK, bold=False)
+    font_b = Font(name=FONT_MAIN, size=8, color=FC_BLACK, bold=True)
+    font_i = Font(name=FONT_MAIN, size=8, color=FC_BLACK, bold=False, italic=True)
+    a_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    a_c = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    def sc(r: int, c: int, v: str | int | None = None):
+        cl = ws.cell(row=r, column=c)
+        # MergedCell: chỉ dùng khi tô border / font, không gán value (read-only); v=None bỏ qua gán.
+        if v is not None:
+            _set_openpyxl_cell_value(cl, v)
+        return cl
+
+    def border_block(r0: int, c0: int, r1: int, c1: int) -> None:
+        for r in range(r0, r1 + 1):
+            for c in range(c0, c1 + 1):
+                sc(r, c).border = b_all
+
+    def apply_meta_14_merges(r: int) -> None:
+        """Dòng 1–4: gộp A–B, C–D, E–J; dòng 1–3 gộp K–P; dòng 4 gộp N–P (K–M tách)."""
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+        ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=4)
+        ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=10)
+        if r in (1, 2, 3):
+            ws.merge_cells(start_row=r, start_column=11, end_row=r, end_column=16)
+        else:
+            ws.merge_cells(start_row=r, start_column=14, end_row=r, end_column=16)
+
+    def apply_row56_merges(r: int) -> None:
+        """Dòng 5–6: A–B, C–D, E–J, N–P; K, L, M riêng (11–13)."""
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+        ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=4)
+        ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=10)
+        ws.merge_cells(start_row=r, start_column=14, end_row=r, end_column=16)
+
+    for r in (1, 2, 3, 4):
+        apply_meta_14_merges(r)
+    for r in (5, 6):
+        apply_row56_merges(r)
+    # Một ô tiêu đề N/A/B (gộp K–M) chỉ ở hàng 5
+    ws.merge_cells(start_row=5, start_column=11, end_row=5, end_column=13)
+
+    # Nhãn cột A–B: viết thường, bold (đúng khoảng "Lines  of code")
+    _LBL_FN_CODE = "Function Code"
+    _LBL_CREATED = "Created By"
+    _LBL_LOC = "Lines  of code"
+    _LBL_TESTREQ = "Test requirement"
+
+    # Hàng 1: A:B nhãn; C:D UTC; E:J Function name; K:P Login
+    sc(1, 1, _LBL_FN_CODE)
+    sc(1, 1).font = font_b
+    sc(1, 1).alignment = a_left
+    sc(1, 3, _DEFAULT_FUNCTION_CODE)
+    sc(1, 3).font = font_i
+    sc(1, 3).alignment = a_c
+    sc(1, 5, "Function Name")
+    sc(1, 5).font = font_b
+    sc(1, 5).alignment = a_left
+    sc(1, 11, _DEFAULT_FUNCTION_NAME)
+    sc(1, 11).font = font_i
+    sc(1, 11).alignment = a_c
+
+    # Hàng 2
+    sc(2, 1, _LBL_CREATED)
+    sc(2, 1).font = font_b
+    sc(2, 1).alignment = a_left
+    sc(2, 3, _DEFAULT_PERSON)
+    sc(2, 3).font = font_i
+    sc(2, 3).alignment = a_c
+    sc(2, 5, "Executed By")
+    sc(2, 5).font = font_b
+    sc(2, 5).alignment = a_left
+    sc(2, 11, _DEFAULT_PERSON)
+    sc(2, 11).font = font_i
+    sc(2, 11).alignment = a_c
+
+    # Hàng 3: C:D 160; E:J Lack of test cases; K:P trống
+    sc(3, 1, _LBL_LOC)
+    sc(3, 1).font = font_b
+    sc(3, 1).alignment = a_left
+    sc(3, 3, _DEFAULT_LINES_OF_CODE)
+    sc(3, 3).font = font_i
+    sc(3, 3).alignment = a_c
+    sc(3, 5, "Lack of test cases")
+    sc(3, 5).font = font_b
+    sc(3, 5).alignment = a_left
+    sc(3, 11, "")
+
+    # Hàng 4: A:B nhãn, còn lại rỗng
+    sc(4, 1, _LBL_TESTREQ)
+    sc(4, 1).font = font_b
+    sc(4, 1).alignment = a_left
+    for c in (3, 5, 11, 12, 13, 14):
+        sc(4, c, "")
+
+    # Hàng 5: viết thường, đậm, căn trái; K–M gộp 1 ô "N/A/B" căn giữa
+    for col, t in ((1, "Passed"), (3, "Failed"), (5, "Untested")):
+        sc(5, col, t)
+        sc(5, col).font = font_b
+        sc(5, col).alignment = a_left
+    sc(5, 11, "N/A/B")
+    sc(5, 11).font = font_b
+    sc(5, 11).alignment = a_c
+    sc(5, 14, "Total test cases")
+    sc(5, 14).font = font_b
+    sc(5, 14).alignment = a_left
+
+    use_formulas = c0 >= 0 and c1 >= c0 and h_row >= 0 and nab_row >= 0 and r_pf >= 0
+    f6e = _row6_formula_env_overrides()
+    if use_formulas:
+        cL = get_column_letter(c0 + 1)
+        cR = get_column_letter(c1 + 1)
+        h_e = h_row + 1 + offset
+        t_e = nab_row + 1 + offset
+        pf_e = r_pf + 1 + offset
+        rng_t = f"${cL}${t_e}:${cR}${t_e}"
+        rng_pf = f"${cL}${pf_e}:${cR}${pf_e}"
+        h_hdr = f"${cL}${h_e}:${cR}${h_e}"
+        sc(6, 1, f6e[1] or f"=COUNTIF({rng_pf},\"P\")")
+        sc(6, 1).font = font_8
+        sc(6, 1).alignment = a_c
+        sc(6, 3, f6e[3] or f"=COUNTIF({rng_pf},\"F\")+COUNTIF({rng_pf},\"Failed\")")
+        sc(6, 3).font = font_8
+        sc(6, 3).alignment = a_c
+        sc(6, 5, f6e[5] or f"=COUNTBLANK({rng_pf})")
+        sc(6, 5).font = font_8
+        sc(6, 5).alignment = a_c
+        sc(6, 11, f6e[11] or f"=COUNTIF({rng_t},\"N\")")
+        sc(6, 12, f6e[12] or f"=COUNTIF({rng_t},\"A\")")
+        sc(6, 13, f6e[13] or f"=COUNTIF({rng_t},\"B\")")
+        for c in (11, 12, 13):
+            sc(6, c).font = font_8
+            sc(6, c).alignment = a_c
+        sc(6, 14, f6e[14] or f"=COLUMNS({h_hdr})")
+        sc(6, 14).font = font_8
+        sc(6, 14).alignment = a_c
+    else:
+        for col in (1, 3, 5, 11, 12, 13, 14):
+            val = f6e.get(col)
+            c = sc(6, col, val if val is not None else "")
+            c.font = font_8
+            c.alignment = a_c
+    for c in range(1, last_c + 1):
+        c7 = sc(7, c, None)
+        c7.font = font_8
+    # Chỉ kẻ A1:P6 (bảng metadata); hàng 7 trống — không kẻ.
+    border_block(1, 1, 6, last_c)
+
+
 def _join_b_c_d_into_b(grid: List[List[str]], nrows: int, h_row: Optional[int]) -> None:
     """Trước khi merge B:D: gom nội dung B,C,D vào ô B (tránh mất chữ khi chỉ C/D có mô tả). Bỏ qua hàng mã TCH (sẽ gộp A1:D1)."""
     for ri in range(nrows):
@@ -128,6 +396,8 @@ def _join_b_c_d_into_b(grid: List[List[str]], nrows: int, h_row: Optional[int]) 
         b = (r[1] or "").strip()
         c = (r[2] or "").strip()
         d = (r[3] or "").strip()
+        if _is_excel_formula_str(b) or _is_excel_formula_str(c) or _is_excel_formula_str(d):
+            continue
         if not b and not c and not d:
             continue
         parts = [p for p in (b, c, d) if p]
@@ -155,10 +425,14 @@ def _preprocess_data_columns(
         if use_cases and _is_executed_date_row_b(b):
             for ci in range(c0, c1 + 1):
                 if ci < w and (row[ci] or "").strip():
+                    if _is_excel_formula_str(str(row[ci] or "")):
+                        continue
                     row[ci] = _last_date_in_cell(str(row[ci] or ""))
         if use_cases and _is_passed_failed_row_b(b):
             for ci in range(c0, c1 + 1):
                 if ci < w and (row[ci] or "").strip():
+                    if _is_excel_formula_str(str(row[ci] or "")):
+                        continue
                     row[ci] = _slash_right_label(str(row[ci] or ""))
     if 0 <= r_res < nrows and r_res < len(grid):
         row = grid[r_res]
@@ -252,7 +526,13 @@ def grid_to_workbook_bytes(grid: List[List[str]]) -> bytes:
         _preprocess_data_columns(grid, nrows, -1, -1, r_res)
     # Sau khi xóa "Type" trùng ở cùng hàng Result, tìm lại dòng Type cho merge B–D
     r_type = _find_r_type_row(grid, nrows)
+    r_pf = _find_r_passed_failed_row(grid, nrows)
     _join_b_c_d_into_b(grid, nrows, h_row)
+    nab_r = _find_nab_data_row(grid, nrows, c0, c1, r_type, r_res)
+
+    T = REPORT_HEADER_ROWS
+    h_meta = h_row if h_row is not None else -1
+    c0m, c1m = (c0, c1) if h_row is not None else (-1, -1)
 
     wb = Workbook()
     ws = wb.active
@@ -260,17 +540,15 @@ def grid_to_workbook_bytes(grid: List[List[str]]) -> bytes:
         raise RuntimeError("no active sheet")
     ws.title = "Matrix"
 
+    _write_unit_test_metadata_header(ws, T, c0m, c1m, h_meta, nab_r, r_pf, ncols)
+
     for ri, r in enumerate(grid):
+        wrow = _row_excel(ri, T)
         for ci, v in enumerate(r):
-            c = ws.cell(row=ri + 1, column=ci + 1, value=v if v else None)
+            c = ws.cell(row=wrow, column=ci + 1)
+            _set_openpyxl_cell_value(c, v if v or _is_excel_formula_str(str(v or "")) else None)
             c.font = Font(name=FONT_MAIN, size=8, color=FC_BLACK, bold=False)
             c.alignment = Alignment(vertical="center", wrap_text=True)
-
-    thin = Side(style="thin", color="000000")
-    b_all = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for r in range(1, nrows + 1):
-        for c in range(1, ncols + 1):
-            ws.cell(r, c).border = b_all
 
     def merge_1a(r1: int, c1: int, r2: int, c2: int) -> None:
         if r1 > r2 or c1 > c2:
@@ -279,28 +557,28 @@ def grid_to_workbook_bytes(grid: List[List[str]]) -> bytes:
 
     # Cột A: Condition
     if r_cond >= 0 and r_conf > r_cond:
-        merge_1a(r_cond + 1, 1, r_conf, 1)
+        merge_1a(r_cond + 1 + T, 1, r_conf + T, 1)
     # Cột A: Confirm → hết dòng trước hàng bắt đầu khối Result (A = Result)
     if r_conf >= 0 and r_res > r_conf:
-        merge_1a(r_conf + 1, 1, r_res, 1)
-    # Cột A: Result (A=Result) + hàng 1: B..D (trước Type)
+        merge_1a(r_conf + 1 + T, 1, r_res + T, 1)
+    # Cột A: Result (A=Result) + … (trước Type)
     if r_res >= 0:
         a_val = _row_i_col0_strips(grid, r_res) or "Result"
-        ws.cell(row=r_res + 1, column=1, value=a_val)
+        ws.cell(row=r_res + 1 + T, column=1, value=a_val)
         if r_type >= 0 and r_type > r_res and r_type + 3 < nrows:
             end_1b = min(r_type + 4, nrows)
-            merge_1a(r_res + 1, 1, end_1b, 1)
+            merge_1a(r_res + 1 + T, 1, end_1b + T, 1)
         else:
-            merge_1a(r_res + 1, 1, min(r_res + 5, nrows), 1)
-    # B:D mọi hàng dữ liệu (nội dung đã gom vào B; trừ hàng mã TCH ở bước gộp A1:D1)
+            merge_1a(r_res + 1 + T, 1, min(r_res + 5, nrows) + T, 1)
+    # B:D mỗi hàng ma trận (trừ hàng mã TCH: gộp A–D ở bước sau)
     if ncols >= 4:
         for ri in range(nrows):
             if h_row is not None and ri == h_row:
                 continue
-            merge_1a(ri + 1, 2, ri + 1, 4)
-    # A1:D1: góc + nền dark blue 26 (cùng hàng mã TCH-xxx)
+            merge_1a(ri + 1 + T, 2, ri + 1 + T, 4)
+    # A:D hàng mã thử
     if h_row is not None and nrows > h_row and ncols >= 4:
-        merge_1a(h_row + 1, 1, h_row + 1, 4)
+        merge_1a(h_row + 1 + T, 1, h_row + 1 + T, 4)
 
     if h_row is not None and c0 <= c1 and c1 >= 0:
         c_start = c0 + 1
@@ -312,8 +590,8 @@ def grid_to_workbook_bytes(grid: List[List[str]]) -> bytes:
         else:
             last_0 = nrows - 5 if nrows > h_row + 5 else nrows - 1
         if last_0 > h_row:
-            a1 = f"{get_column_letter(c_start)}{h_row + 2}"
-            a2 = f"{get_column_letter(c_end)}{last_0 + 1}"
+            a1 = f"{get_column_letter(c_start)}{h_row + 2 + T}"
+            a2 = f"{get_column_letter(c_end)}{last_0 + 1 + T}"
             dv = DataValidation(
                 type="list",
                 formula1='"O"',
@@ -329,7 +607,7 @@ def grid_to_workbook_bytes(grid: List[List[str]]) -> bytes:
     for ri in range(nrows):
         a0 = _row_i_col0_strips(grid, ri)
         if a0 in ("Condition", "Confirm", "Result") or (a0 and _MAIN_A.match(a0)):
-            cell = ws.cell(row=ri + 1, column=1)
+            cell = ws.cell(row=ri + 1 + T, column=1)
             if not cell.value and a0:
                 cell.value = a0
             cell.font = font_w
@@ -338,26 +616,35 @@ def grid_to_workbook_bytes(grid: List[List[str]]) -> bytes:
     for ri in range(nrows):
         b = _row_i_col1_strips(grid, ri)
         if b in ("Precondition", "Return", "Exception", "Log message") or (b and _EXACT_B.match(b)):
-            c = ws.cell(row=ri + 1, column=2)
+            c = ws.cell(row=ri + 1 + T, column=2)
             c.font = Font(name=FONT_MAIN, size=8, bold=True, color=FC_BLACK)
     if h_row is not None and 0 <= c0 <= c1:
-        corner = ws.cell(row=h_row + 1, column=1)
+        corner = ws.cell(row=h_row + 1 + T, column=1)
         corner.fill = fill
         corner.font = font_w
         corner.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         for c in range(c0, c1 + 1):
-            cell = ws.cell(row=h_row + 1, column=c + 1)
+            cell = ws.cell(row=h_row + 1 + T, column=c + 1)
             cell.font = Font(name=FONT_MAIN, size=8, bold=True, color=FC_WHITE)
             cell.fill = PatternFill(start_color=FILL_DARK, end_color=FILL_DARK, fill_type="solid")
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     if r_res >= 0:
-        cr = ws.cell(row=r_res + 1, column=1)
+        cr = ws.cell(row=r_res + 1 + T, column=1)
         if not (cr.value and str(cr.value).strip()):
             cr.value = "Result"
         cr.font = font_w
         cr.fill = fill
         cr.alignment = a_align_main
+
+    # Chỉ kẻ bảng ma trận từ hàng 8 (T+1) tới hết dữ liệu; cột 1..ncols. Ô còn lại không kẻ.
+    thin2 = Side(style="thin", color="000000")
+    b_all2 = Border(left=thin2, right=thin2, top=thin2, bottom=thin2)
+    r2_start = T + 1
+    r2_end = nrows + T
+    for r in range(r2_start, r2_end + 1):
+        for c in range(1, ncols + 1):
+            ws.cell(r, c).border = b_all2
 
     bio = io.BytesIO()
     wb.save(bio)
